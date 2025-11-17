@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+/**
+ * @title SportfolioIPO
+ * @dev ERC-1155 smart contract for IPO stage with sigmoid bonding curve pricing
+ * Only handles IPO phase - secondary market functionality excluded for MVP
+ */
+contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
+    
+    // Constants
+    uint256 public constant BASE_PRICE = 30 ether; // $30 starting price
+    uint256 public constant TOTAL_SUPPLY = 2_000_000; // 2M total tokens
+    uint256 public constant SMOOTHING_FACTOR = 200_000; // Prevents extreme price spikes
+    uint256 public constant PLATFORM_FEE_RATE = 300; // 3% = 300 basis points
+    uint256 public constant BASIS_POINTS = 10_000; // 100% = 10,000 basis points
+    
+    // Team token ID (Lakers example)
+    uint256 public constant LAKERS_TOKEN_ID = 1;
+    
+    // State variables
+    uint256 public tokensSold;
+    bool public ipoActive = true;
+    address public platformFeeRecipient;
+    
+    // Events
+    event TokensPurchased(address indexed buyer, uint256 amount, uint256 totalCost, uint256 platformFee);
+    event IPOCompleted(uint256 finalPrice, uint256 timestamp);
+    event IPOPaused();
+    event IPOResumed();
+    
+    // Modifiers
+    modifier onlyDuringIPO() {
+        require(ipoActive, "IPO has ended");
+        require(tokensSold < TOTAL_SUPPLY, "All tokens sold");
+        _;
+    }
+    
+    constructor(
+        string memory uri,
+        address _platformFeeRecipient
+    ) ERC1155(uri) Ownable() {
+        require(_platformFeeRecipient != address(0), "Invalid fee recipient");
+        platformFeeRecipient = _platformFeeRecipient;
+    }
+    
+    /**
+     * @dev Returns current token price based on sigmoid curve
+     * Formula: Price = $30 + ($30 × Sigmoid_Factor)
+     * Where: Sigmoid_Factor = tokens_sold / (total_supply - tokens_sold + smoothing_factor)
+     */
+    function getCurrentPrice() public view returns (uint256) {
+        if (tokensSold == 0) return BASE_PRICE;
+        
+        uint256 remaining = TOTAL_SUPPLY - tokensSold;
+        uint256 sigmoidFactor = (tokensSold * 1e18) / (remaining + SMOOTHING_FACTOR);
+        
+        return BASE_PRICE + (BASE_PRICE * sigmoidFactor / 1e18);
+    }
+    
+    /**
+     * @dev Calculates total cost for purchasing specific token amount
+     * Uses continuous pricing - each token priced individually
+     */
+    function calculatePurchaseCost(uint256 tokenAmount) public view returns (uint256 tokenCost, uint256 platformFee) {
+        require(tokenAmount > 0, "Must buy at least 1 token");
+        require(tokensSold + tokenAmount <= TOTAL_SUPPLY, "Exceeds total supply");
+        
+        uint256 totalCost = 0;
+        uint256 currentSold = tokensSold;
+        
+        // Calculate cost in 100-token increments for gas efficiency
+        for (uint256 i = 0; i < tokenAmount; i += 100) {
+            uint256 batchSize = (i + 100 > tokenAmount) ? (tokenAmount - i) : 100;
+            uint256 batchPrice = getPriceAtSupply(currentSold + i);
+            totalCost += batchPrice * batchSize;
+        }
+        
+        tokenCost = totalCost;
+        platformFee = (totalCost * PLATFORM_FEE_RATE) / BASIS_POINTS;
+    }
+    
+    /**
+     * @dev Internal function to get price at specific supply level
+     */
+    function getPriceAtSupply(uint256 soldAmount) internal pure returns (uint256) {
+        if (soldAmount == 0) return BASE_PRICE;
+        
+        uint256 remaining = TOTAL_SUPPLY - soldAmount;
+        uint256 sigmoidFactor = (soldAmount * 1e18) / (remaining + SMOOTHING_FACTOR);
+        
+        return BASE_PRICE + (BASE_PRICE * sigmoidFactor / 1e18);
+    }
+    
+    /**
+     * @dev Purchase tokens during IPO phase
+     * Implements continuous pricing with batched execution
+     */
+    function buyTokens(uint256 amount) external payable nonReentrant onlyDuringIPO whenNotPaused {
+        require(amount > 0, "Must buy at least 1 token");
+        require(tokensSold + amount <= TOTAL_SUPPLY, "Exceeds total supply");
+        
+        (uint256 tokenCost, uint256 platformFee) = calculatePurchaseCost(amount);
+        uint256 totalRequired = tokenCost + platformFee;
+        
+        require(msg.value >= totalRequired, "Insufficient payment");
+        
+        // Mint tokens to buyer
+        _mint(msg.sender, LAKERS_TOKEN_ID, amount, "");
+        
+        // Update tokens sold
+        tokensSold += amount;
+        
+        // Transfer platform fee
+        if (platformFee > 0) {
+            payable(platformFeeRecipient).transfer(platformFee);
+        }
+        
+        // Refund excess payment
+        if (msg.value > totalRequired) {
+            payable(msg.sender).transfer(msg.value - totalRequired);
+        }
+        
+        emit TokensPurchased(msg.sender, amount, tokenCost, platformFee);
+        
+        // Check if IPO is complete
+        if (tokensSold == TOTAL_SUPPLY) {
+            ipoActive = false;
+            emit IPOCompleted(getCurrentPrice(), block.timestamp);
+        }
+    }
+    
+    /**
+     * @dev Returns total tokens sold so far
+     */
+    function getTokensSold() external view returns (uint256) {
+        return tokensSold;
+    }
+    
+    /**
+     * @dev Returns tokens still available for purchase
+     */
+    function getRemainingTokens() external view returns (uint256) {
+        return TOTAL_SUPPLY - tokensSold;
+    }
+    
+    /**
+     * @dev Returns maximum tokens that can be bought (prevents overselling)
+     */
+    function getMaxPurchaseAmount() external view returns (uint256) {
+        return TOTAL_SUPPLY - tokensSold;
+    }
+    
+    /**
+     * @dev Returns current sigmoid factor for price calculation
+     */
+    function getSigmoidFactor() external view returns (uint256) {
+        if (tokensSold == 0) return 0;
+        
+        uint256 remaining = TOTAL_SUPPLY - tokensSold;
+        return (tokensSold * 1e18) / (remaining + SMOOTHING_FACTOR);
+    }
+    
+    /**
+     * @dev Returns the smoothing factor parameter
+     */
+    function getSmoothingFactor() external pure returns (uint256) {
+        return SMOOTHING_FACTOR;
+    }
+    
+    /**
+     * @dev Returns the total token supply
+     */
+    function getTotalSupply() external pure returns (uint256) {
+        return TOTAL_SUPPLY;
+    }
+    
+    /**
+     * @dev Returns the base starting price
+     */
+    function getBasePrice() external pure returns (uint256) {
+        return BASE_PRICE;
+    }
+    
+    /**
+     * @dev Returns IPO status
+     */
+    function isIPOActive() external view returns (bool) {
+        return ipoActive && tokensSold < TOTAL_SUPPLY;
+    }
+    
+    /**
+     * @dev Emergency pause IPO (owner only)
+     */
+    function pauseIPO() external onlyOwner {
+        _pause();
+        emit IPOPaused();
+    }
+    
+    /**
+     * @dev Resume IPO (owner only)
+     */
+    function resumeIPO() external onlyOwner {
+        _unpause();
+        emit IPOResumed();
+    }
+    
+    /**
+     * @dev Manually complete IPO (owner only)
+     * For emergency situations or strategic decisions
+     */
+    function completeIPO() external onlyOwner {
+        require(ipoActive, "IPO already completed");
+        
+        uint256 finalPrice = getCurrentPrice();
+        ipoActive = false;
+        
+        emit IPOCompleted(finalPrice, block.timestamp);
+    }
+    
+    /**
+     * @dev Update platform fee recipient (owner only)
+     */
+    function setPlatformFeeRecipient(address _newRecipient) external onlyOwner {
+        require(_newRecipient != address(0), "Invalid recipient");
+        platformFeeRecipient = _newRecipient;
+    }
+    
+    /**
+     * @dev Withdraw contract balance (owner only)
+     * For any remaining ETH after IPO completion
+     */
+    function withdraw() external onlyOwner {
+        require(!ipoActive, "IPO still active");
+        
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No balance to withdraw");
+        
+        payable(owner()).transfer(balance);
+    }
+    
+    /**
+     * @dev Override to prevent transfers during IPO phase
+     * Tokens should not be transferable until secondary market opens
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 id,
+        uint256 amount,
+        bytes memory data
+    ) public virtual override {
+        require(!ipoActive, "Transfers not allowed during IPO");
+        super.safeTransferFrom(from, to, id, amount, data);
+    }
+    
+    /**
+     * @dev Override to prevent batch transfers during IPO phase
+     */
+    function safeBatchTransferFrom(
+        address from,
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) public virtual override {
+        require(!ipoActive, "Transfers not allowed during IPO");
+        super.safeBatchTransferFrom(from, to, ids, amounts, data);
+    }
+}

@@ -1,4 +1,8 @@
 {
+  "name": "sportfolio-hardhat",
+  "version": "1.0.0",
+  "description": "Sportfolio Hardhat project",
+  "author": "Tahir Nazir",
   "dependencies": {
     "@openzeppelin/contracts": "^4.9.6"
   },

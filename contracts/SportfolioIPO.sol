@@ -5,6 +5,8 @@ import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
  * @title SportfolioIPO
@@ -12,9 +14,11 @@ import "@openzeppelin/contracts/security/Pausable.sol";
  * Only handles IPO phase - secondary market functionality excluded for MVP
  */
 contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
     
     // Constants
-    uint256 public constant BASE_PRICE = 30 ether; // $30 starting price
+    // BASE_PRICE is in USDC units (6 decimals): $30 USD = 30,000,000 USDC units
+    uint256 public constant BASE_PRICE = 30_000_000; // $30 USD in USDC (6 decimals)
     uint256 public constant TOTAL_SUPPLY = 2_000_000; // 2M total tokens
     uint256 public constant SMOOTHING_FACTOR = 200_000; // Prevents extreme price spikes
     uint256 public constant PLATFORM_FEE_RATE = 300; // 3% = 300 basis points
@@ -27,6 +31,7 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
     uint256 public tokensSold;
     bool public ipoActive = true;
     address public platformFeeRecipient;
+    IERC20 public paymentToken; // USDC token address
     
     // Events
     event TokensPurchased(address indexed buyer, uint256 amount, uint256 totalCost, uint256 platformFee);
@@ -43,10 +48,13 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
     
     constructor(
         string memory uri,
-        address _platformFeeRecipient
+        address _platformFeeRecipient,
+        address _paymentToken
     ) ERC1155(uri) Ownable() {
         require(_platformFeeRecipient != address(0), "Invalid fee recipient");
+        require(_paymentToken != address(0), "Invalid payment token");
         platformFeeRecipient = _platformFeeRecipient;
+        paymentToken = IERC20(_paymentToken);
     }
     
     /**
@@ -65,7 +73,8 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
     
     /**
      * @dev Calculates total cost for purchasing specific token amount
-     * Uses continuous pricing - each token priced individually
+     * Uses continuous pricing - each token priced individually based on exact supply position
+     * Formula: Sum of prices for token #1, #2, #3... #N where each token has its exact calculated price
      */
     function calculatePurchaseCost(uint256 tokenAmount) public view returns (uint256 tokenCost, uint256 platformFee) {
         require(tokenAmount > 0, "Must buy at least 1 token");
@@ -74,11 +83,14 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
         uint256 totalCost = 0;
         uint256 currentSold = tokensSold;
         
-        // Calculate cost in 100-token increments for gas efficiency
-        for (uint256 i = 0; i < tokenAmount; i += 100) {
-            uint256 batchSize = (i + 100 > tokenAmount) ? (tokenAmount - i) : 100;
-            uint256 batchPrice = getPriceAtSupply(currentSold + i);
-            totalCost += batchPrice * batchSize;
+        // Continuous pricing: Calculate individual price for each token
+        // Token #1 priced at supply level (tokensSold + 0)
+        // Token #2 priced at supply level (tokensSold + 1)
+        // Token #3 priced at supply level (tokensSold + 2)
+        // ... and so on
+        for (uint256 i = 0; i < tokenAmount; i++) {
+            uint256 tokenPrice = getPriceAtSupply(currentSold + i);
+            totalCost += tokenPrice;
         }
         
         tokenCost = totalCost;
@@ -98,17 +110,31 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
     }
     
     /**
-     * @dev Purchase tokens during IPO phase
+     * @dev Purchase tokens during IPO phase using USDC
      * Implements continuous pricing with batched execution
+     * 
+     * IMPORTANT: Users must approve USDC spending before calling this function
+     * Frontend should: 1) Approve USDC, 2) Call buyTokens()
+     * 
+     * @param amount Number of tokens to purchase
      */
-    function buyTokens(uint256 amount) external payable nonReentrant onlyDuringIPO whenNotPaused {
+    function buyTokens(uint256 amount) external nonReentrant onlyDuringIPO whenNotPaused {
         require(amount > 0, "Must buy at least 1 token");
         require(tokensSold + amount <= TOTAL_SUPPLY, "Exceeds total supply");
         
         (uint256 tokenCost, uint256 platformFee) = calculatePurchaseCost(amount);
         uint256 totalRequired = tokenCost + platformFee;
         
-        require(msg.value >= totalRequired, "Insufficient payment");
+        // Check user has approved enough USDC
+        uint256 allowance = paymentToken.allowance(msg.sender, address(this));
+        require(allowance >= totalRequired, "Insufficient USDC allowance. Please approve first.");
+        
+        // Check user has enough USDC balance
+        uint256 balance = paymentToken.balanceOf(msg.sender);
+        require(balance >= totalRequired, "Insufficient USDC balance");
+        
+        // Transfer USDC from buyer to contract
+        paymentToken.safeTransferFrom(msg.sender, address(this), totalRequired);
         
         // Mint tokens to buyer
         _mint(msg.sender, LAKERS_TOKEN_ID, amount, "");
@@ -116,14 +142,9 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
         // Update tokens sold
         tokensSold += amount;
         
-        // Transfer platform fee
+        // Transfer platform fee to recipient
         if (platformFee > 0) {
-            payable(platformFeeRecipient).transfer(platformFee);
-        }
-        
-        // Refund excess payment
-        if (msg.value > totalRequired) {
-            payable(msg.sender).transfer(msg.value - totalRequired);
+            paymentToken.safeTransfer(platformFeeRecipient, platformFee);
         }
         
         emit TokensPurchased(msg.sender, amount, tokenCost, platformFee);
@@ -232,16 +253,24 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
     }
     
     /**
-     * @dev Withdraw contract balance (owner only)
-     * For any remaining ETH after IPO completion
+     * @dev Withdraw USDC balance (owner only)
+     * For any remaining USDC after IPO completion
      */
     function withdraw() external onlyOwner {
         require(!ipoActive, "IPO still active");
         
-        uint256 balance = address(this).balance;
+        uint256 balance = paymentToken.balanceOf(address(this));
         require(balance > 0, "No balance to withdraw");
         
-        payable(owner()).transfer(balance);
+        paymentToken.safeTransfer(owner(), balance);
+    }
+    
+    /**
+     * @dev Get payment token address (USDC)
+     * Useful for frontend to know which token to approve
+     */
+    function getPaymentToken() external view returns (address) {
+        return address(paymentToken);
     }
     
     /**

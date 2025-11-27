@@ -19,30 +19,43 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
     // Constants
     // BASE_PRICE is in USDC units (6 decimals): $30 USD = 30,000,000 USDC units
     uint256 public constant BASE_PRICE = 30_000_000; // $30 USD in USDC (6 decimals)
-    uint256 public constant TOTAL_SUPPLY = 2_000_000; // 2M total tokens
+    uint256 public constant TOTAL_SUPPLY = 2_000_000; // 2M total tokens per team
     uint256 public constant SMOOTHING_FACTOR = 200_000; // Prevents extreme price spikes
     uint256 public constant PLATFORM_FEE_RATE = 300; // 3% = 300 basis points
     uint256 public constant BASIS_POINTS = 10_000; // 100% = 10,000 basis points
     
-    // Team token ID (Lakers example)
-    uint256 public constant LAKERS_TOKEN_ID = 1;
+    // Team IPO data structure
+    struct TeamIPO {
+        uint256 tokenId;           // ERC1155 token ID (1, 2, 3...)
+        string teamName;           // Team name stored on-chain for quick access
+        uint256 tokensSold;        // Tokens sold for this team
+        bool ipoActive;            // Is IPO active for this team
+        uint256 ipoStartTime;      // When IPO started
+        uint256 ipoEndTime;        // When IPO ended (0 if still active)
+    }
     
     // State variables
-    uint256 public tokensSold;
-    bool public ipoActive = true;
+    mapping(uint256 => TeamIPO) public teams;  // tokenId => TeamIPO
+    uint256[] public teamIds;                  // List of all team token IDs
     address public platformFeeRecipient;
     IERC20 public paymentToken; // USDC token address
     
     // Events
-    event TokensPurchased(address indexed buyer, uint256 amount, uint256 totalCost, uint256 platformFee);
-    event IPOCompleted(uint256 finalPrice, uint256 timestamp);
-    event IPOPaused();
-    event IPOResumed();
+    event TeamAdded(uint256 indexed tokenId, string teamName, uint256 timestamp);
+    event TokensPurchased(address indexed buyer, uint256 indexed tokenId, uint256 amount, uint256 totalCost, uint256 platformFee);
+    event IPOCompleted(uint256 indexed tokenId, uint256 finalPrice, uint256 timestamp);
+    event IPOPaused(uint256 indexed tokenId);
+    event IPOResumed(uint256 indexed tokenId);
     
     // Modifiers
-    modifier onlyDuringIPO() {
-        require(ipoActive, "IPO has ended");
-        require(tokensSold < TOTAL_SUPPLY, "All tokens sold");
+    modifier onlyDuringIPO(uint256 tokenId) {
+        require(teams[tokenId].ipoActive, "Team IPO has ended");
+        require(teams[tokenId].tokensSold < TOTAL_SUPPLY, "All tokens sold");
+        _;
+    }
+    
+    modifier teamExists(uint256 tokenId) {
+        require(teams[tokenId].tokenId != 0, "Team does not exist");
         _;
     }
     
@@ -58,30 +71,35 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
     }
     
     /**
-     * @dev Returns current token price based on sigmoid curve
+     * @dev Returns current token price for a specific team based on sigmoid curve
      * Formula: Price = $30 + ($30 × Sigmoid_Factor)
      * Where: Sigmoid_Factor = tokens_sold / (total_supply - tokens_sold + smoothing_factor)
+     * @param tokenId Team token ID
      */
-    function getCurrentPrice() public view returns (uint256) {
-        if (tokensSold == 0) return BASE_PRICE;
+    function getCurrentPrice(uint256 tokenId) public view teamExists(tokenId) returns (uint256) {
+        TeamIPO memory team = teams[tokenId];
+        if (team.tokensSold == 0) return BASE_PRICE;
         
-        uint256 remaining = TOTAL_SUPPLY - tokensSold;
-        uint256 sigmoidFactor = (tokensSold * 1e18) / (remaining + SMOOTHING_FACTOR);
+        uint256 remaining = TOTAL_SUPPLY - team.tokensSold;
+        uint256 sigmoidFactor = (team.tokensSold * 1e18) / (remaining + SMOOTHING_FACTOR);
         
         return BASE_PRICE + (BASE_PRICE * sigmoidFactor / 1e18);
     }
     
     /**
-     * @dev Calculates total cost for purchasing specific token amount
+     * @dev Calculates total cost for purchasing specific token amount for a team
      * Uses continuous pricing - each token priced individually based on exact supply position
      * Formula: Sum of prices for token #1, #2, #3... #N where each token has its exact calculated price
+     * @param tokenId Team token ID
+     * @param tokenAmount Number of tokens to purchase
      */
-    function calculatePurchaseCost(uint256 tokenAmount) public view returns (uint256 tokenCost, uint256 platformFee) {
+    function calculatePurchaseCost(uint256 tokenId, uint256 tokenAmount) public view teamExists(tokenId) returns (uint256 tokenCost, uint256 platformFee) {
         require(tokenAmount > 0, "Must buy at least 1 token");
-        require(tokensSold + tokenAmount <= TOTAL_SUPPLY, "Exceeds total supply");
+        TeamIPO memory team = teams[tokenId];
+        require(team.tokensSold + tokenAmount <= TOTAL_SUPPLY, "Exceeds total supply");
         
         uint256 totalCost = 0;
-        uint256 currentSold = tokensSold;
+        uint256 currentSold = team.tokensSold;
         
         // Continuous pricing: Calculate individual price for each token
         // Token #1 priced at supply level (tokensSold + 0)
@@ -110,19 +128,21 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
     }
     
     /**
-     * @dev Purchase tokens during IPO phase using USDC
+     * @dev Purchase tokens for a specific team during IPO phase using USDC
      * Implements continuous pricing with batched execution
      * 
      * IMPORTANT: Users must approve USDC spending before calling this function
      * Frontend should: 1) Approve USDC, 2) Call buyTokens()
      * 
+     * @param tokenId Team token ID
      * @param amount Number of tokens to purchase
      */
-    function buyTokens(uint256 amount) external nonReentrant onlyDuringIPO whenNotPaused {
+    function buyTokens(uint256 tokenId, uint256 amount) external nonReentrant onlyDuringIPO(tokenId) whenNotPaused {
         require(amount > 0, "Must buy at least 1 token");
-        require(tokensSold + amount <= TOTAL_SUPPLY, "Exceeds total supply");
+        TeamIPO storage team = teams[tokenId];
+        require(team.tokensSold + amount <= TOTAL_SUPPLY, "Exceeds total supply");
         
-        (uint256 tokenCost, uint256 platformFee) = calculatePurchaseCost(amount);
+        (uint256 tokenCost, uint256 platformFee) = calculatePurchaseCost(tokenId, amount);
         uint256 totalRequired = tokenCost + platformFee;
         
         // Check user has approved enough USDC
@@ -137,54 +157,107 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
         paymentToken.safeTransferFrom(msg.sender, address(this), totalRequired);
         
         // Mint tokens to buyer
-        _mint(msg.sender, LAKERS_TOKEN_ID, amount, "");
+        _mint(msg.sender, tokenId, amount, "");
         
-        // Update tokens sold
-        tokensSold += amount;
+        // Update this team's tokens sold
+        team.tokensSold += amount;
         
         // Transfer platform fee to recipient
         if (platformFee > 0) {
             paymentToken.safeTransfer(platformFeeRecipient, platformFee);
         }
         
-        emit TokensPurchased(msg.sender, amount, tokenCost, platformFee);
+        emit TokensPurchased(msg.sender, tokenId, amount, tokenCost, platformFee);
         
-        // Check if IPO is complete
-        if (tokensSold == TOTAL_SUPPLY) {
-            ipoActive = false;
-            emit IPOCompleted(getCurrentPrice(), block.timestamp);
+        // Check if this team's IPO is complete
+        if (team.tokensSold == TOTAL_SUPPLY) {
+            team.ipoActive = false;
+            team.ipoEndTime = block.timestamp;
+            emit IPOCompleted(tokenId, getCurrentPrice(tokenId), block.timestamp);
         }
     }
     
     /**
-     * @dev Returns total tokens sold so far
+     * @dev Add a new team IPO (owner only)
+     * @param tokenId Team token ID (should be sequential: 1, 2, 3...)
+     * @param teamName Team name (stored on-chain for quick access)
      */
-    function getTokensSold() external view returns (uint256) {
-        return tokensSold;
-    }
-    
-    /**
-     * @dev Returns tokens still available for purchase
-     */
-    function getRemainingTokens() external view returns (uint256) {
-        return TOTAL_SUPPLY - tokensSold;
-    }
-    
-    /**
-     * @dev Returns maximum tokens that can be bought (prevents overselling)
-     */
-    function getMaxPurchaseAmount() external view returns (uint256) {
-        return TOTAL_SUPPLY - tokensSold;
-    }
-    
-    /**
-     * @dev Returns current sigmoid factor for price calculation
-     */
-    function getSigmoidFactor() external view returns (uint256) {
-        if (tokensSold == 0) return 0;
+    function addTeam(uint256 tokenId, string memory teamName) external onlyOwner {
+        require(tokenId > 0, "Token ID must be greater than 0");
+        require(teams[tokenId].tokenId == 0, "Team already exists");
+        require(bytes(teamName).length > 0, "Team name cannot be empty");
         
-        uint256 remaining = TOTAL_SUPPLY - tokensSold;
-        return (tokensSold * 1e18) / (remaining + SMOOTHING_FACTOR);
+        teams[tokenId] = TeamIPO({
+            tokenId: tokenId,
+            teamName: teamName,
+            tokensSold: 0,
+            ipoActive: true,
+            ipoStartTime: block.timestamp,
+            ipoEndTime: 0
+        });
+        
+        teamIds.push(tokenId);
+        
+        emit TeamAdded(tokenId, teamName, block.timestamp);
+    }
+    
+    /**
+     * @dev Get team information
+     * @param tokenId Team token ID
+     */
+    function getTeamInfo(uint256 tokenId) external view returns (TeamIPO memory) {
+        require(teams[tokenId].tokenId != 0, "Team does not exist");
+        return teams[tokenId];
+    }
+    
+    /**
+     * @dev Get all team token IDs
+     */
+    function getAllTeams() external view returns (uint256[] memory) {
+        return teamIds;
+    }
+    
+    /**
+     * @dev Get total number of teams
+     */
+    function getTeamCount() external view returns (uint256) {
+        return teamIds.length;
+    }
+    
+    /**
+     * @dev Returns total tokens sold for a specific team
+     * @param tokenId Team token ID
+     */
+    function getTokensSold(uint256 tokenId) external view teamExists(tokenId) returns (uint256) {
+        return teams[tokenId].tokensSold;
+    }
+    
+    /**
+     * @dev Returns tokens still available for purchase for a specific team
+     * @param tokenId Team token ID
+     */
+    function getRemainingTokens(uint256 tokenId) external view teamExists(tokenId) returns (uint256) {
+        return TOTAL_SUPPLY - teams[tokenId].tokensSold;
+    }
+    
+    /**
+     * @dev Returns maximum tokens that can be bought for a specific team (prevents overselling)
+     * @param tokenId Team token ID
+     */
+    function getMaxPurchaseAmount(uint256 tokenId) external view teamExists(tokenId) returns (uint256) {
+        return TOTAL_SUPPLY - teams[tokenId].tokensSold;
+    }
+    
+    /**
+     * @dev Returns current sigmoid factor for price calculation for a specific team
+     * @param tokenId Team token ID
+     */
+    function getSigmoidFactor(uint256 tokenId) external view teamExists(tokenId) returns (uint256) {
+        TeamIPO memory team = teams[tokenId];
+        if (team.tokensSold == 0) return 0;
+        
+        uint256 remaining = TOTAL_SUPPLY - team.tokensSold;
+        return (team.tokensSold * 1e18) / (remaining + SMOOTHING_FACTOR);
     }
     
     /**
@@ -209,39 +282,49 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
     }
     
     /**
-     * @dev Returns IPO status
+     * @dev Returns IPO status for a specific team
+     * @param tokenId Team token ID
      */
-    function isIPOActive() external view returns (bool) {
-        return ipoActive && tokensSold < TOTAL_SUPPLY;
+    function isIPOActive(uint256 tokenId) external view teamExists(tokenId) returns (bool) {
+        TeamIPO memory team = teams[tokenId];
+        return team.ipoActive && team.tokensSold < TOTAL_SUPPLY;
     }
     
     /**
-     * @dev Emergency pause IPO (owner only)
+     * @dev Emergency pause IPO for a specific team (owner only)
+     * @param tokenId Team token ID
      */
-    function pauseIPO() external onlyOwner {
-        _pause();
-        emit IPOPaused();
+    function pauseIPO(uint256 tokenId) external onlyOwner teamExists(tokenId) {
+        require(teams[tokenId].ipoActive, "IPO already paused or completed");
+        teams[tokenId].ipoActive = false;
+        emit IPOPaused(tokenId);
     }
     
     /**
-     * @dev Resume IPO (owner only)
+     * @dev Resume IPO for a specific team (owner only)
+     * @param tokenId Team token ID
      */
-    function resumeIPO() external onlyOwner {
-        _unpause();
-        emit IPOResumed();
+    function resumeIPO(uint256 tokenId) external onlyOwner teamExists(tokenId) {
+        require(!teams[tokenId].ipoActive, "IPO already active");
+        require(teams[tokenId].tokensSold < TOTAL_SUPPLY, "All tokens sold");
+        teams[tokenId].ipoActive = true;
+        emit IPOResumed(tokenId);
     }
     
     /**
-     * @dev Manually complete IPO (owner only)
+     * @dev Manually complete IPO for a specific team (owner only)
      * For emergency situations or strategic decisions
+     * @param tokenId Team token ID
      */
-    function completeIPO() external onlyOwner {
-        require(ipoActive, "IPO already completed");
+    function completeIPO(uint256 tokenId) external onlyOwner teamExists(tokenId) {
+        TeamIPO storage team = teams[tokenId];
+        require(team.ipoActive, "IPO already completed");
         
-        uint256 finalPrice = getCurrentPrice();
-        ipoActive = false;
+        uint256 finalPrice = getCurrentPrice(tokenId);
+        team.ipoActive = false;
+        team.ipoEndTime = block.timestamp;
         
-        emit IPOCompleted(finalPrice, block.timestamp);
+        emit IPOCompleted(tokenId, finalPrice, block.timestamp);
     }
     
     /**
@@ -254,15 +337,17 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
     
     /**
      * @dev Withdraw USDC balance (owner only)
-     * For any remaining USDC after IPO completion
+     * Can withdraw even if some teams' IPOs are still active
+     * @param amount Amount to withdraw (0 = withdraw all)
      */
-    function withdraw() external onlyOwner {
-        require(!ipoActive, "IPO still active");
-        
+    function withdraw(uint256 amount) external onlyOwner {
         uint256 balance = paymentToken.balanceOf(address(this));
         require(balance > 0, "No balance to withdraw");
         
-        paymentToken.safeTransfer(owner(), balance);
+        uint256 withdrawAmount = amount == 0 ? balance : amount;
+        require(withdrawAmount <= balance, "Insufficient balance");
+        
+        paymentToken.safeTransfer(owner(), withdrawAmount);
     }
     
     /**
@@ -276,6 +361,7 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
     /**
      * @dev Override to prevent transfers during IPO phase
      * Tokens should not be transferable until secondary market opens
+     * Checks if the specific team's IPO is active
      */
     function safeTransferFrom(
         address from,
@@ -284,12 +370,13 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
         uint256 amount,
         bytes memory data
     ) public virtual override {
-        require(!ipoActive, "Transfers not allowed during IPO");
+        require(teams[id].tokenId == 0 || !teams[id].ipoActive, "Transfers not allowed during IPO");
         super.safeTransferFrom(from, to, id, amount, data);
     }
     
     /**
      * @dev Override to prevent batch transfers during IPO phase
+     * Checks each token ID's IPO status
      */
     function safeBatchTransferFrom(
         address from,
@@ -298,7 +385,9 @@ contract SportfolioIPO is ERC1155, Ownable, ReentrancyGuard, Pausable {
         uint256[] memory amounts,
         bytes memory data
     ) public virtual override {
-        require(!ipoActive, "Transfers not allowed during IPO");
+        for (uint256 i = 0; i < ids.length; i++) {
+            require(teams[ids[i]].tokenId == 0 || !teams[ids[i]].ipoActive, "Transfers not allowed during IPO");
+        }
         super.safeBatchTransferFrom(from, to, ids, amounts, data);
     }
 }

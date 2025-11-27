@@ -20,10 +20,20 @@ task("accounts", "Prints the list of accounts", async (taskArgs, hre) => {
 });
 
 module.exports = {
-  solidity: "0.8.19",
+  solidity: {
+    version: "0.8.19",
+    settings: {
+      optimizer: {
+        enabled: true,
+        runs: 200
+      }
+    }
+  },
   defaultNetwork: 'sepolia',
   networks: {
-    hardhat: {},
+    hardhat: {
+      allowUnlimitedContractSize: true  // Allow larger contracts in tests
+    },
     sepolia: {
       url: process.env.SEPOLIA_RPC_URL || "https://sepolia.infura.io/v3/4c1dcf3c417444a09cca375cc81c9017",
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : []
